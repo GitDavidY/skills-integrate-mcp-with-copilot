@@ -14,11 +14,29 @@ from typing import Optional
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+# OpenAPI tag metadata
+tags_metadata = [
+    {
+        "name": "activities",
+        "description": "Operations for browsing and managing extracurricular activities.",
+    },
+    {
+        "name": "auth",
+        "description": "Teacher authentication operations (login, logout, status).",
+    },
+]
 
 app = FastAPI(
     title="Mergington High School API",
-    description="API for viewing and signing up for extracurricular activities",
+    description=(
+        "API for viewing and signing up for extracurricular activities at "
+        "Mergington High School.\n\n"
+        "**Interactive docs:** `/docs` (Swagger UI) · `/redoc` (ReDoc)"
+    ),
+    version="1.0.0",
+    openapi_tags=tags_metadata,
 )
 
 # Mount the static files directory
@@ -30,9 +48,52 @@ app.mount(
 )
 
 
+# ---------------------------------------------------------------------------
+# Request / Response models
+# ---------------------------------------------------------------------------
+
+
 class TeacherLoginRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(..., examples=["ms.smith"])
+    password: str = Field(..., examples=["teach1234"])
+
+
+class ActivityDetail(BaseModel):
+    """Details of a single extracurricular activity."""
+
+    description: str = Field(..., examples=["Learn strategies and compete in chess tournaments"])
+    schedule: str = Field(..., examples=["Fridays, 3:30 PM - 5:00 PM"])
+    max_participants: int = Field(..., examples=[12])
+    participants: list[str] = Field(
+        ..., examples=[["michael@mergington.edu", "daniel@mergington.edu"]]
+    )
+
+
+class MessageResponse(BaseModel):
+    """Generic success message."""
+
+    message: str = Field(..., examples=["Operation completed successfully"])
+
+
+class AuthLoginResponse(BaseModel):
+    """Successful teacher login payload."""
+
+    message: str = Field(..., examples=["Teacher logged in successfully"])
+    token: str = Field(..., examples=["Tgf3k2L9mXpQr8sNvYwZ1A"])
+    username: str = Field(..., examples=["ms.smith"])
+
+
+class AuthStatusResponse(BaseModel):
+    """Current authentication status."""
+
+    authenticated: bool = Field(..., examples=[True])
+    username: Optional[str] = Field(None, examples=["ms.smith"])
+
+
+class ErrorResponse(BaseModel):
+    """Standard error payload returned by the API."""
+
+    detail: str = Field(..., examples=["Activity not found"])
 
 
 def load_teachers() -> dict[str, str]:
@@ -130,12 +191,49 @@ def root():
     return RedirectResponse(url="/static/index.html")
 
 
-@app.get("/activities")
-def get_activities():
+@app.get(
+    "/activities",
+    tags=["activities"],
+    summary="List all activities",
+    description=(
+        "Returns every extracurricular activity offered at Mergington High School, "
+        "including its description, schedule, maximum participant limit, and the "
+        "list of currently enrolled student emails."
+    ),
+    response_model=dict[str, ActivityDetail],
+    responses={
+        200: {
+            "description": "A mapping of activity name → activity details.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "Chess Club": {
+                            "description": "Learn strategies and compete in chess tournaments",
+                            "schedule": "Fridays, 3:30 PM - 5:00 PM",
+                            "max_participants": 12,
+                            "participants": ["michael@mergington.edu", "daniel@mergington.edu"],
+                        }
+                    }
+                }
+            },
+        }
+    },
+)
+def get_activities() -> dict[str, ActivityDetail]:
     return activities
 
 
-@app.post("/auth/login")
+@app.post(
+    "/auth/login",
+    tags=["auth"],
+    summary="Teacher login",
+    description="Authenticate a teacher with username and password. Returns a bearer token to use in subsequent requests.",
+    response_model=AuthLoginResponse,
+    responses={
+        200: {"description": "Login successful, bearer token returned."},
+        401: {"model": ErrorResponse, "description": "Invalid username or password."},
+    },
+)
 def teacher_login(payload: TeacherLoginRequest):
     expected_password = teacher_credentials.get(payload.username)
     if not expected_password or expected_password != payload.password:
@@ -150,7 +248,17 @@ def teacher_login(payload: TeacherLoginRequest):
     }
 
 
-@app.post("/auth/logout")
+@app.post(
+    "/auth/logout",
+    tags=["auth"],
+    summary="Teacher logout",
+    description="Invalidate the current teacher session. Requires a valid bearer token in the `Authorization` header.",
+    response_model=MessageResponse,
+    responses={
+        200: {"description": "Logout successful."},
+        401: {"model": ErrorResponse, "description": "Missing or invalid bearer token."},
+    },
+)
 def teacher_logout(
     teacher: str = Depends(get_authenticated_teacher),
     authorization: Optional[str] = Header(default=None),
@@ -161,7 +269,16 @@ def teacher_logout(
     return {"message": f"Teacher {teacher} logged out"}
 
 
-@app.get("/auth/status")
+@app.get(
+    "/auth/status",
+    tags=["auth"],
+    summary="Authentication status",
+    description="Returns whether the caller is currently authenticated as a teacher.",
+    response_model=AuthStatusResponse,
+    responses={
+        200: {"description": "Current authentication state."},
+    },
+)
 def auth_status(authorization: Optional[str] = Header(default=None)):
     token = get_bearer_token(authorization)
     username = teacher_sessions.get(token) if token else None
@@ -170,7 +287,33 @@ def auth_status(authorization: Optional[str] = Header(default=None)):
     return {"authenticated": True, "username": username}
 
 
-@app.post("/activities/{activity_name}/signup")
+@app.post(
+    "/activities/{activity_name}/signup",
+    tags=["activities"],
+    summary="Sign up a student for an activity",
+    description=(
+        "Enrol a student (identified by email) in the specified activity. "
+        "Requires teacher authentication via a bearer token.\n\n"
+        "**Errors:**\n"
+        "- `404` – activity not found\n"
+        "- `400` – student is already signed up\n"
+        "- `401` – missing or invalid bearer token"
+    ),
+    response_model=MessageResponse,
+    responses={
+        200: {
+            "description": "Student successfully enrolled.",
+            "content": {
+                "application/json": {
+                    "example": {"message": "Teacher ms.smith signed up student@mergington.edu for Chess Club"}
+                }
+            },
+        },
+        400: {"model": ErrorResponse, "description": "Student is already signed up."},
+        401: {"model": ErrorResponse, "description": "Teacher authentication required."},
+        404: {"model": ErrorResponse, "description": "Activity not found."},
+    },
+)
 def signup_for_activity(
     activity_name: str,
     email: str,
@@ -189,7 +332,33 @@ def signup_for_activity(
     return {"message": f"Teacher {teacher} signed up {email} for {activity_name}"}
 
 
-@app.delete("/activities/{activity_name}/unregister")
+@app.delete(
+    "/activities/{activity_name}/unregister",
+    tags=["activities"],
+    summary="Unregister a student from an activity",
+    description=(
+        "Remove a student (identified by email) from the specified activity. "
+        "Requires teacher authentication via a bearer token.\n\n"
+        "**Errors:**\n"
+        "- `404` – activity not found\n"
+        "- `400` – student is not currently signed up\n"
+        "- `401` – missing or invalid bearer token"
+    ),
+    response_model=MessageResponse,
+    responses={
+        200: {
+            "description": "Student successfully removed.",
+            "content": {
+                "application/json": {
+                    "example": {"message": "Teacher ms.smith unregistered student@mergington.edu from Chess Club"}
+                }
+            },
+        },
+        400: {"model": ErrorResponse, "description": "Student is not signed up for this activity."},
+        401: {"model": ErrorResponse, "description": "Teacher authentication required."},
+        404: {"model": ErrorResponse, "description": "Activity not found."},
+    },
+)
 def unregister_from_activity(
     activity_name: str,
     email: str,
